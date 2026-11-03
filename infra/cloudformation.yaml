@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploy the KIET Student Placement Portal repository on Ubuntu EC2.
+  Provisions VPC networking, EC2, PostgreSQL, Node.js API, React/Vite build and Nginx.
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair for SSH access.
+  SSHLocation:
+    Type: String
+    Description: Your public IPv4 CIDR for SSH, e.g. 203.0.113.10/32. Do not use 0.0.0.0/0.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Enter an IPv4 CIDR such as 203.0.113.10/32.
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: t3.small recommended for the combined application and database.
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 41
+    AllowedPattern: '^[A-Za-z0-9!#$%&()*+,\-./:;<=>?@\[\]^_{|}~]+$'
+    Description: PostgreSQL password for placement_user. Single quotes are not allowed.
+  RepositoryUrl:
+    Type: String
+    Default: https://github.com/ankurbhardwajkiet/student-placement-portal.git
+    Description: Public Git repository URL containing backend, frontend and database folders.
+
+Resources:
+  PortalVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: placement-portal-vpc
+
+  PortalInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: placement-portal-igw
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PortalVPC
+      InternetGatewayId: !Ref PortalInternetGateway
+
+  PortalPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PortalVPC
+      CidrBlock: 10.20.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: placement-portal-public-subnet
+
+  PortalRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PortalVPC
+
+  PortalDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PortalRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref PortalInternetGateway
+
+  PortalSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PortalPublicSubnet
+      RouteTableId: !Ref PortalRouteTable
+
+  PortalSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH from supplied admin CIDR and public HTTP.
+      VpcId: !Ref PortalVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: placement-portal-sg
+
+  PortalInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: PortalSubnetRouteTableAssociation
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PortalPublicSubnet
+      SecurityGroupIds:
+        - !GetAtt PortalSecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: student-placement-portal
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -Eeuo pipefail
+            exec > >(tee -a /var/log/placement-portal-bootstrap.log | logger -t placement-bootstrap -s 2>/dev/console) 2>&1
+
+            echo "=== Student Placement Portal deployment started ==="
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get upgrade -y
+            apt-get install -y git curl ca-certificates postgresql postgresql-contrib nginx
+
+            # Add swap to reduce the chance of an out-of-memory failure during Vite build.
+            if [ ! -f /swapfile ]; then
+              fallocate -l 2G /swapfile
+              chmod 600 /swapfile
+              mkswap /swapfile
+              swapon /swapfile
+              echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            fi
+
+            # Install Node.js 20.
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            apt-get install -y nodejs
+
+            systemctl enable --now postgresql
+            systemctl enable --now nginx
+
+            # Create the PostgreSQL application role and database.
+            sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE USER placement_user WITH PASSWORD '${DBPassword}';"
+            sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE placement_portal OWNER placement_user;"
+
+            # Clone the exact project repository.
+            install -d -o ubuntu -g ubuntu /opt/student-placement-portal
+            git clone --depth 1 '${RepositoryUrl}' /opt/student-placement-portal
+            cd /opt/student-placement-portal
+
+            # Initialize schema and sample rows.
+            PGPASSWORD='${DBPassword}' psql -h 127.0.0.1 -U placement_user -d placement_portal -v ON_ERROR_STOP=1 -f database/init.sql
+
+            # Install and configure the Express API.
+            cd /opt/student-placement-portal/backend
+            npm install --omit=dev
+            cat > .env <<'ENVVARS'
+            PORT=5000
+            DB_HOST=127.0.0.1
+            DB_PORT=5432
+            DB_NAME=placement_portal
+            DB_USER=placement_user
+            DB_PASSWORD=${DBPassword}
+            ENVVARS
+            chmod 600 .env
+
+            cat > /etc/systemd/system/placement-api.service <<'SERVICE'
+            [Unit]
+            Description=KIET Student Placement Portal API
+            After=network.target postgresql.service
+            Requires=postgresql.service
+
+            [Service]
+            Type=simple
+            User=ubuntu
+            Group=ubuntu
+            WorkingDirectory=/opt/student-placement-portal/backend
+            ExecStart=/usr/bin/node src/server.js
+            Restart=always
+            RestartSec=5
+            Environment=NODE_ENV=production
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICE
+
+            chown -R ubuntu:ubuntu /opt/student-placement-portal
+            systemctl daemon-reload
+            systemctl enable --now placement-api
+
+            # Build the Vite frontend to call Nginx's same-origin /api reverse proxy.
+            cd /opt/student-placement-portal/frontend
+            npm install
+            printf 'VITE_API_URL=/api\n' > .env.production
+            npm run build
+            install -d -o www-data -g www-data /var/www/placement-portal
+            cp -a dist/. /var/www/placement-portal/
+            chown -R www-data:www-data /var/www/placement-portal
+
+            # Nginx serves the SPA and forwards /api requests to Express on localhost:5000.
+            cat > /etc/nginx/sites-available/placement-portal <<'NGINX'
+            server {
+                listen 80 default_server;
+                listen [::]:80 default_server;
+                server_name _;
+                root /var/www/placement-portal;
+                index index.html;
+                client_max_body_size 20m;
+
+                location /api {
+                    proxy_pass http://127.0.0.1:5000;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host ${!host};
+                    proxy_set_header X-Real-IP ${!remote_addr};
+                    proxy_set_header X-Forwarded-For ${!proxy_add_x_forwarded_for};
+                    proxy_set_header X-Forwarded-Proto ${!scheme};
+                }
+
+                location / {
+                    try_files $uri $uri/ /index.html;
+                }
+            }
+            NGINX
+            ln -sfn /etc/nginx/sites-available/placement-portal /etc/nginx/sites-enabled/placement-portal
+            rm -f /etc/nginx/sites-enabled/default
+            nginx -t
+            systemctl reload nginx
+
+            # Record a final local health check in the bootstrap log.
+            for attempt in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1/api/health; then
+                echo
+                echo "=== Deployment completed successfully ==="
+                exit 0
+              fi
+              sleep 5
+            done
+
+            echo "Health check did not pass. Inspect service logs and this bootstrap log."
+            systemctl --no-pager --full status placement-api || true
+            exit 1
+          - DBPassword: !Ref DBPassword
+            RepositoryUrl: !Ref RepositoryUrl
+
+Outputs:
+  PortalURL:
+    Description: Student Placement Portal website.
+    Value: !Sub 'http://${PortalInstance.PublicDnsName}'
+  PortalPublicIP:
+    Description: EC2 public IPv4 address.
+    Value: !GetAtt PortalInstance.PublicIp
+  APIHealthURL:
+    Description: API health check through Nginx.
+    Value: !Sub 'http://${PortalInstance.PublicDnsName}/api/health'
+  SSHCommand:
+    Description: Replace YOUR_KEY.pem with your private key filename.
+    Value: !Sub 'ssh -i YOUR_KEY.pem ubuntu@${PortalInstance.PublicDnsName}'
+  BootstrapLog:
+    Description: EC2 deployment log path.
+    Value: /var/log/placement-portal-bootstrap.log
